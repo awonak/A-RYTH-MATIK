@@ -102,6 +102,7 @@ enum TopMenu {
   MENU_ALL_RESET,
   MENU_ALL_MUTE,
   MENU_PRESET,
+  MENU_TEMPO,
   MENU_RAND,
   MENU_LAST
 };
@@ -148,6 +149,11 @@ byte selected_slot = 0;
 bool disp_refresh = true;
 unsigned long last_refresh = 0;
 bool allMutedFlag = false;
+bool internalClock = false;
+bool showOverlay = false;
+
+int tempo = 120;  // beats per minute.
+int period = 60000 / tempo / 4; // one minute in ms divided by tempo divided by 4 for 16th note period.
 
 //const byte graph_x[6] PROGMEM = { 0, 40, 80, 15, 55, 95 }, graph_y[6] PROGMEM = { 0, 0, 0, 32, 32, 32 };
 const byte graph_x[6] = { 0, 40, 80, 15, 55, 95 }, graph_y[6] = { 0, 0, 0, 32, 32, 32 };
@@ -164,6 +170,9 @@ const byte MAX_STEPS = 16;
 const byte MAX_PATTERNS = 17;
 const int MIN_REFRESH_DURATION = 250;  // Used by fast inputs like encoder rotation to throttle the display refresh.
 unsigned long gate_timer = 0;
+unsigned long last_clock_input = 0;
+const int INTERNAL_CLOCK_SWITCH_DURATION = 2000;  // Used by fast inputs like encoder rotation to throttle the display refresh.
+
 
 const static byte euc16[MAX_PATTERNS][MAX_STEPS] PROGMEM = {  //euclidian rythm
   { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
@@ -362,9 +371,6 @@ void setup() {
   encoder.setRateLimit(20);
   encoder.setClickHandler(onEncoderClicked);
   encoder.setEncoderHandler(onEncoderRotation);
-  encoder.setPressedHandler(onPress);
-  encoder.setEncoderPressedHandler(onEncoderPressedRotation);  // Added handler for pressed rotation
-  encoder.setEncoderReleasedHandler(onEncoderReleased);
 
   initIO();
   initDisplay();
@@ -405,15 +411,30 @@ void loop() {
   //-----------------trigger detect, reset & output----------------------
   bool rst_in = RESET::isInputHigh(), trg_in = CLK::isInputHigh();
   bool force_refresh = false;
+  bool beat_start = false;
 
   // Handle reset input
   if (old_rst_in == 0 && rst_in == 1) {
-    memset(playing_step, 0, sizeof(playing_step));
+    resetSeq();
     force_refresh = true;
   }
 
   // Trigger detection and response
   if (old_trg_in == 0 && trg_in == 1) {
+    beat_start = true;
+    internalClock = false;
+  }
+
+  // Switch to internal clock if no clock input received for set duration.
+  if (millis() > last_clock_input + INTERNAL_CLOCK_SWITCH_DURATION) {
+    internalClock = true;
+  }
+
+  if (millis() > gate_timer + period) {
+    beat_start = true;
+  }
+
+  if (beat_start) {
     gate_timer = millis();
     force_refresh = true;
     CLK_LED::setOutput(1);
@@ -541,29 +562,57 @@ void initDisplay() {
 }
 
 void onEncoderClicked(EncoderButton &eb) {
+  // Clicked while overlay shown.
+  if (showOverlay) {
+    switch (selected_menu) {
+    case MENU_PRESET:
+      loadDefaultConfig(&currentConfig, selected_preset);
+      break;
+    case MENU_SAVE:
+      saveToEEPROM(selected_slot);
+      break;
+    case MENU_LOAD:
+      loadFromEEPROM(selected_slot);
+      break;
+    case MENU_TEMPO:
+      // recalculate period.
+      period = 60000 / tempo / 4;
+      break;
+    }
+    disp_refresh = true;
+  }
+
+  switch (selected_menu) {
   // Channel-specific actions
-  if (selected_menu <= MENU_CH_6) {
+  case MENU_CH_1:
+  case MENU_CH_2:
+  case MENU_CH_3:
+  case MENU_CH_4:
+  case MENU_CH_5:
+  case MENU_CH_6:
     // Click should only advance selected setting when a channel top menu is selected.
     selected_setting = static_cast<Setting>((selected_setting + 1) % SETTING_LAST);
     disp_refresh = true;
-  }
+    break;
   // Mode-specific actions
-  else if (selected_menu == MENU_ALL_RESET) {
+  case MENU_ALL_RESET:
     resetSeq();
     disp_refresh = true;
-  } else if (selected_menu == MENU_ALL_MUTE) {
+    break;
+  case MENU_ALL_MUTE:
     toggleAllMutes();
     disp_refresh = true;
-  }
-  /*
-  if (selected_menu == MENU_TEMP) {  // mode only has a Tap button // seems resources are to sparse for TapTempo library
-                                      // Dial in tempo with the encoder and / or TapTempo via encoder button
-                                      //adjustTempo();
-  }
-  */
-  else if (selected_menu == MENU_RAND) {  //
+    break;
+  case MENU_RAND:
     Random_change();
     disp_refresh = true;
+    break;
+  case MENU_SAVE:
+  case MENU_LOAD:
+  case MENU_PRESET:
+  case MENU_TEMPO:
+    showOverlay = !showOverlay;
+    break;
   }
 }
 
@@ -578,76 +627,49 @@ void onEncoderRotation(EncoderButton &eb) {
     acceleratedIncrement = -acceleratedIncrement;  // Ensure that the direction of increment is preserved
   }
 
-  if (!allMutedFlag) {  // Only handle setting navigation if not all muted
+  if (!allMutedFlag && !showOverlay) {  // Only handle setting navigation if not all muted
     handleSettingNavigation(acceleratedIncrement);
   }
-}
 
-void onPress(EncoderButton &eb) {
-  // The encoder has been pressed, wake up the display.
-  disp_refresh = true;
-}
-
-void onEncoderPressedRotation(EncoderButton &eb) {
-  int increment = encoder.increment();  // Get the incremental change (could be negative, positive, or zero)
-  if (increment == 0) return;
-
-  disp_refresh = true;
-
-  int acceleratedIncrement = increment * increment;  // Squaring the increment for quicker adjustments
-  if (increment < 0) {
-    acceleratedIncrement = -acceleratedIncrement;  // Ensure that the direction of increment is preserved
-  }
-
-  if (selected_setting == SETTING_TOP_MENU && selected_menu == MENU_PRESET) {
-    // Handle preset selection
-    selected_preset = (selected_preset + acceleratedIncrement + sizeof(defaultSlots) / sizeof(SlotConfiguration)) % (sizeof(defaultSlots) / sizeof(SlotConfiguration));
-  }
-
-  // Handle channel switching only when in specific modes
-  if (selected_setting != SETTING_TOP_MENU) {
-
-    selected_menu = static_cast<TopMenu>((selected_menu + acceleratedIncrement + MENU_LAST) % MENU_LAST);
-    // Ensure the selected_menu is within the range of channels
-    if (selected_menu > MENU_CH_6) {
-      selected_menu = MENU_CH_1;
+  if (selected_setting == SETTING_TOP_MENU){
+    
+    if (selected_menu == MENU_PRESET) {
+      // Handle preset selection
+      selected_preset = (selected_preset + acceleratedIncrement + sizeof(defaultSlots) / sizeof(SlotConfiguration)) % (sizeof(defaultSlots) / sizeof(SlotConfiguration));
     }
-    return;
-  }
 
-  if (selected_menu == MENU_SAVE || selected_menu == MENU_LOAD) {
-    // EEPROM slot selection for saving or loading
-    selected_slot = (selected_slot + acceleratedIncrement + NUM_MEMORY_SLOTS) % NUM_MEMORY_SLOTS;
-  }
+    if (selected_menu == MENU_TEMPO) {
+      tempo += acceleratedIncrement;
+    }
 
-  if (selected_setting == SETTING_TOP_MENU && selected_menu <= MENU_CH_6) {
-    // Adjust the Hits value for the selected channel to more quickly edit the beat/rhythm
-    currentConfig.hits[selected_menu] = (currentConfig.hits[selected_menu] + acceleratedIncrement + 17) % 17;
-  } else if (selected_menu == MENU_RAND) {
-    // Random X mode here
-    Random_change();
-  } else if (selected_menu == MENU_RANDOM_ADVANCE) {
-    // Ensure `bar_select` stays within the range of 1 to 5
-    bar_select += increment;
-    if (bar_select < 1) bar_select = 6;
-    if (bar_select > 6) bar_select = 1;
-  }
-}
+    // Handle channel switching only when in specific modes
+    if (selected_setting != SETTING_TOP_MENU) {
 
-void onEncoderReleased(EncoderButton &eb) {
-  switch (selected_menu) {
-    case MENU_PRESET:
-      loadDefaultConfig(&currentConfig, selected_preset);
-      disp_refresh = true;
-      break;
-    case MENU_SAVE:
-      saveToEEPROM(selected_slot);
-      disp_refresh = true;
-      break;
-    case MENU_LOAD:
-      loadFromEEPROM(selected_slot);
-      disp_refresh = true;
-      break;
+      selected_menu = static_cast<TopMenu>((selected_menu + acceleratedIncrement + MENU_LAST) % MENU_LAST);
+      // Ensure the selected_menu is within the range of channels
+      if (selected_menu > MENU_CH_6) {
+        selected_menu = MENU_CH_1;
+      }
+      return;
+    }
+
+    if (selected_menu == MENU_SAVE || selected_menu == MENU_LOAD) {
+      // EEPROM slot selection for saving or loading
+      selected_slot = (selected_slot + acceleratedIncrement + NUM_MEMORY_SLOTS) % NUM_MEMORY_SLOTS;
+    }
+
+    if (selected_menu <= MENU_CH_6) {
+      // Adjust the Hits value for the selected channel to more quickly edit the beat/rhythm
+      currentConfig.hits[selected_menu] = (currentConfig.hits[selected_menu] + acceleratedIncrement + 17) % 17;
+    } else if (selected_menu == MENU_RAND) {
+      // Random X mode here
+      Random_change();
+    } else if (selected_menu == MENU_RANDOM_ADVANCE) {
+      // Ensure `bar_select` stays within the range of 1 to 5
+      bar_select += increment;
+      if (bar_select < 1) bar_select = 6;
+      if (bar_select > 6) bar_select = 1;
+    }
   }
 }
 
@@ -847,6 +869,7 @@ void drawModeMenu(TopMenu select_ch) {
     case MENU_ALL_RESET: leftMenu('R', 'S', 'E', 'T'); break;
     case MENU_ALL_MUTE: leftMenu('M', 'U', 'T', 'E'); break;
     case MENU_PRESET: leftMenu('P', 'R', 'S', 'T'); break;
+    case MENU_TEMPO: leftMenu('B', 'P', 'M', ' '); break;
     case MENU_RAND: leftMenu('R', 'A', 'N', 'D'); break;
     default: break;
   }
@@ -970,12 +993,15 @@ void OLED_display(bool force_refresh) {
   }
 
   // Draw top-level menu overlays while encoder is pressed.
-  if (encoder.buttonState() == 0) {  // NOTE: We can remove this check to make the overlay visible without holding encoder.
+  if (showOverlay) {  // NOTE: We can remove this check to make the overlay visible without holding encoder.
     if (selected_setting == SETTING_TOP_MENU && selected_menu == MENU_PRESET) {
       drawPresetSelection();
     }
     if (selected_menu == MENU_SAVE || selected_menu == MENU_LOAD) {
       drawSaveLoadSelection();
+    }
+    if (selected_menu == MENU_TEMPO) {
+      drawTempo();
     }
   }
 
@@ -1179,4 +1205,23 @@ void drawPresetSelection() {
   y1 += 12;
   display.setCursor(x1 + b, y1 + b);
   display.print(presetName);
+}
+
+void drawTempo() {
+  // Display selected slot
+  int16_t x1 = 18, y1 = 14;
+  uint16_t w = 94, h = 34;
+  uint16_t b = 4;
+  uint16_t b2 = 8;
+
+  display.fillRect(x1 - b, y1 - b, w + b2, h + b2, BLACK);  // clear screen underneath
+  display.drawRect(x1, y1, w, h, WHITE);
+
+  display.setCursor(x1 + b, y1 + b);
+  display.print(F("Adjust BPM:"));
+
+  display.setCursor(60, 29);
+  display.setTextSize(2);
+  display.print(tempo + 1, DEC);
+  display.setTextSize(1);
 }
